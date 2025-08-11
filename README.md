@@ -42,7 +42,6 @@ This benchmark has been specifically engineered to deliver the highest possible 
     *   `crypto-benchmark.js`: The main script that orchestrates the benchmark, manages the UI, and provisions the `SharedArrayBuffer`.
     *   `crypto-benchmark.worker.js`: The Web Worker that implements the core measurement engine and writes results to the SAB.
     *   `crypto-benchmark.stats.js`: A utility module for advanced statistical calculations.
-    *   `/utils/security-kit.js`: A centralized library of hardened cryptographic and security utilities.
 *   `/docs`: Contains all project documentation.
     *   `methodology.md`: A detailed, scientific explanation of the measurement and analysis techniques.
     *   `security-constitution.md`: The governing document for all security and engineering decisions.
