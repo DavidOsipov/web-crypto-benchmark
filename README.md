@@ -2,7 +2,6 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://opensource.org/licenses/MIT)
 [![Security Policy](https://img.shields.io/badge/Security-Policy-informational)](./SECURITY.md)
-[![CI Perf Smoke Test](https://github.com/your-username/your-repo/actions/workflows/perf-smoke.yml/badge.svg)](https://github.com/your-username/your-repo/actions/workflows/perf-smoke.yml)
 
 This repository contains the complete source code for a high-precision, browser-based cryptographic hashing benchmark. This code powers an interactive widget designed to perform rigorous, lab-grade performance analysis and allow users to anonymously contribute to a foundational dataset.
 
