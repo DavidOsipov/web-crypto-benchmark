@@ -2,6 +2,7 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://opensource.org/licenses/MIT)
 [![Security Policy](https://img.shields.io/badge/Security-Policy-informational)](./SECURITY.md)
+[![CI Perf Smoke Test](https://github.com/your-username/your-repo/actions/workflows/perf-smoke.yml/badge.svg)](https://github.com/your-username/your-repo/actions/workflows/perf-smoke.yml)
 
 This repository contains the complete source code for a high-precision, browser-based cryptographic hashing benchmark. This code powers an interactive widget designed to perform rigorous, lab-grade performance analysis and allow users to anonymously contribute to a foundational dataset.
 
@@ -22,29 +23,37 @@ You can run the benchmark and contribute your results on the official project pa
 
 This benchmark has been specifically engineered to deliver the highest possible measurement precision, targeting browser engineers, hardware vendors, and performance researchers.
 
+*   **Environment-Aware Measurement Engine:** The benchmark intelligently adapts to its environment to ensure the collection of high-quality, relevant data.
+    *   **Mobile vs. Desktop Profiles:** The engine automatically detects mobile environments and applies a more conservative testing profile. This includes a shorter total runtime and longer batch times to prevent thermal throttling on passively cooled devices, ensuring results reflect sustained performance, not just initial burst speed.
+    *   **Thermal Cooldowns:** On mobile, the benchmark inserts deliberate pauses between heavy tasks to allow the device's SoC to cool, further mitigating the risk of performance degradation from overheating.
+
 *   **Precision-First Measurement Methodology:** Designed to produce exceptionally low-noise and repeatable results by systematically eliminating common sources of measurement error.
     *   **Cross-Origin Isolated Environment:** The benchmark **requires** a cross-origin isolated environment (`COOP`/`COEP` headers). This is a deliberate design choice to unlock high-resolution timers and stronger process isolation, which are critical for accurate sub-millisecond measurements.
-    *   **`SharedArrayBuffer` for Zero-Copy Communication:** All high-frequency timing data is passed from the worker to the main thread via a `SharedArrayBuffer` using a robust, two-counter atomic protocol. This eliminates the CPU overhead and scheduling jitter associated with `postMessage` cloning, ensuring the measurement process itself does not interfere with the results.
+    *   **`SharedArrayBuffer` for Zero-Copy Communication:** All high-frequency timing data is passed from the worker to the main thread via a `SharedArrayBuffer` using a robust, two-counter atomic protocol. This eliminates the CPU overhead and scheduling jitter associated with `postMessage` cloning.
     *   **Dedicated Web Worker Isolation:** All cryptographic tests run in a dedicated Web Worker to prevent UI rendering and other main-thread tasks from contaminating the measurements.
 
 *   **Advanced Statistical Engine:**
-    *   **Robust Estimators:** The primary reported metric is the **Median-of-Means (MoM)**, which is highly resistant to outliers caused by system noise. A non-parametric **Bootstrap Confidence Interval** is also calculated to provide a robust measure of uncertainty.
-    *   **Adaptive Batch Sizing:** The engine intelligently adjusts the number of iterations per batch to target a substantial duration (e.g., ~300ms), maximizing the signal-to-noise ratio for each sample.
+    *   **Robust Estimators:** The primary reported metric is the **Median-of-Means (MoM)**, which is highly resistant to outliers. A non-parametric **Bootstrap Confidence Interval** is also calculated using a performant, securely-seeded PRNG to provide a robust measure of uncertainty.
+    *   **Robust Calibration:** The initial performance estimate for each test is based on the **median** of multiple short runs, preventing a single system hiccup from skewing the entire measurement.
     *   **Automated Remediation:** If a measurement is unstable (high variance), the engine automatically re-runs the test to improve data quality without user intervention.
 
 *   **Secure and Private by Design:**
-    *   **Privacy-Focused Data Collection:** The script collects non-identifiable metrics. A random `anonId` is generated to group sessions from the same browser, and a `runId` identifies each specific test run. No IP addresses are stored by the collection backend.
+    *   **Data Integrity Safeguards:** The benchmark automatically aborts if the browser tab is moved to the background, preventing the collection of invalid data from a throttled process.
+    *   **Privacy-Hardened Telemetry:** The script collects non-identifiable metrics. High-entropy debug data is stripped from telemetry payloads by default and is only included in opt-in debug builds. Raw PRNG seeds are never transmitted.
     *   **Hardened Security:** The project adheres to a strict [Security Constitution](./docs/security-constitution.md), including a strong Content Security Policy (CSP), the use of Trusted Types, and a hardened, secure-by-default design.
 
 ## Project Structure
 
 *   `/src`: Contains the core JavaScript source code.
-    *   `crypto-benchmark.js`: The main script that orchestrates the benchmark, manages the UI, and provisions the `SharedArrayBuffer`.
-    *   `crypto-benchmark.worker.js`: The Web Worker that implements the core measurement engine and writes results to the SAB.
+    *   `crypto-benchmark.js`: The main script that orchestrates the benchmark, manages the UI, and handles environment detection.
+    *   `crypto-benchmark.worker.js`: The Web Worker that implements the core measurement engine.
     *   `crypto-benchmark.stats.js`: A utility module for advanced statistical calculations.
+    *   `/util/prng.js`: A shared module for the fast, securely-seeded Pseudo-Random Number Generator.
 *   `/docs`: Contains all project documentation.
-    *   `methodology.md`: A detailed, scientific explanation of the measurement and analysis techniques.
-    *   `security-constitution.md`: The governing document for all security and engineering decisions.
+    *   `METHODOLOGY_EN.md` & `METHODOLOGY_RU.md`: A detailed, scientific explanation of the measurement and analysis techniques.
+    *   `Security Constitution.md`: The governing document for all security and engineering decisions.
+*   `/tests`: Would contain the Vitest unit, integration, and end-to-end tests.
+*   `/scripts`: Would contain helper scripts, including the `perf-smoke.mjs` harness for CI.
 
 ## Usage
 
@@ -52,7 +61,7 @@ To use this benchmark component in your own cross-origin isolated environment, y
 
 ## Contributing
 
-Contributions are welcome! Please read the [Contributing Guidelines](./CONTRIBUTING.md) for details on our code of conduct and the process for submitting pull requests.
+Contributions are welcome! Please read the [Contributing Guidelines](./CONTRIBUTING.md) for details on our code of conduct and the process for submitting pull requests. All PRs are automatically checked against our performance smoke test to prevent regressions.
 
 ## Author and License
 
