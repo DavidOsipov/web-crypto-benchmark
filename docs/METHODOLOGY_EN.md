@@ -2,7 +2,7 @@
 # Methodology for Data Collection and Analysis for the Web Crypto API Benchmarking Project
 
 * **Document Version:** 4.6
-* **Date:** 2025-08-13
+* **Date:** 2025-08-12
 * **Audience:** Technical specialists, experts in statistics, web performance, and browser technologies.
 
 ## 1. Introduction and Research Goals
