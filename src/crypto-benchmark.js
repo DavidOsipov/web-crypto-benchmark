@@ -6,7 +6,7 @@
 // Author ORCID: 0009-0005-2713-9242
 // Author VIAF: 139173726847611590332
 // Author Wikidata: Q130604188
-// Version: 4.5.1
+// Version: 4.6.3
 // Secure browser hash benchmark widget script (ESM). No inline HTML, no innerHTML.
 import { generateSecureUUID, secureDevLog } from "@utils/security-kit.js";
 import { appPolicy } from "@lib/trusted-types.js";
@@ -16,15 +16,9 @@ import workerURL from "./crypto-benchmark.worker.js?worker&url";
 const MOUNTED = new WeakMap();
 // Use dedicated worker for hashing to keep UI responsive and improve timing fidelity
 // Vite's `?worker&url` ensures a same-origin HTTP(S) asset URL at build time (never data:/blob:).
-// Wrap with Trusted Types at runtime when enforced.
+// Worker() is not a Trusted Types sink; always return a same-origin string URL from bundler.
 const getTrustedWorkerURL = () => {
-  try {
-    if (appPolicy && globalThis.trustedTypes) {
-      return appPolicy.createScriptURL(workerURL);
-    }
-  } catch (e) {
-    try { secureDevLog("warn", "crypto-benchmark", "createScriptURL failed; falling back", { e: String(e) }); } catch {}
-  }
+  try { secureDevLog("info", "crypto-benchmark", "Worker() TT non-sink; using bundler URL string", {}); } catch {}
   return workerURL;
 };
 
@@ -33,8 +27,9 @@ const TEXT = {
     notSupported: "Web Crypto API is unavailable in this browser.",
     running: "Running benchmark…",
     aborted: "Benchmark aborted.",
-  done: "Benchmark complete. Review results below and submit.",
-  unstableDetected: "Analysis complete. We detected some measurement instability. For the most accurate results, we recommend closing demanding apps and tasks and running the test again.",
+    done: "Benchmark complete. Review results below and submit.",
+  errorLabel: "Error",
+    unstableDetected: "Analysis complete. We detected some measurement instability. For the most accurate results, we recommend closing demanding apps and tasks and running the test again.",
     submitting: "Submitting anonymously…",
     submitted: "Thank you! Results submitted.",
     submitDisabled: "Submission disabled (collector not configured).",
@@ -44,13 +39,23 @@ const TEXT = {
     running: "Запуск бенчмарка…",
     aborted: "Бенчмарк прерван.",
     done: "Бенчмарк завершен. Проверьте результаты ниже.",
-  unstableDetected: "Анализ завершен. Обнаружена нестабильность измерений. Для наибольшей точности рекомендуем закрыть требовательные программы и задачи, и запустить тест ещё раз.",
+  errorLabel: "Ошибка",
+    unstableDetected: "Анализ завершен. Обнаружена нестабильность измерений. Для наибольшей точности рекомендуем закрыть требовательные программы и задачи, и запустить тест ещё раз.",
     submitting: "Отправка анонимных данных…",
     submitted: "Спасибо! Результаты отправлены.",
     submitDisabled: "Отправка отключена (коллектор не настроен).",
   },
 };
-const CONFIG = Object.freeze({
+function isMobile() {
+  try {
+  if (navigator.userAgentData?.mobile) return true;
+  } catch {}
+  try {
+  return /Mobi|Android|iPhone|iPad|iPod|Kindle|Silk|Opera Mini/i.test(navigator.userAgent);
+  } catch { return false; }
+}
+
+const BASE_CONFIG = Object.freeze({
   algos: ["SHA-256", "SHA-384", "SHA-512"],
   sizes: [1024, 5 * 1024, 10 * 1024, 20 * 1024, 40 * 1024, 80 * 1024, 100 * 1024],
   poolSize: 8,
@@ -64,15 +69,23 @@ const CONFIG = Object.freeze({
   MIN_RECORDED_BATCHES: 8,         // Ensure at least this many batches for robust stats.
   CV_FLAG_THRESHOLD: 0.10,         // CoV above this triggers remediation/UI flag.
   CV_STOP_THRESHOLD: 0.03,         // Optional: Stop early if extremely stable.
-  MAX_REMEDIATION_ATTEMPTS: 2,     // Auto-retry unstable cells once.
+  MAX_REMEDIATION_ATTEMPTS: 3,     // Auto-retry unstable cells.
   PER_BATCH_SAMPLE_LIMIT: 40,      // Max number of raw per-batch samples to send in payload.
   progressIntervalMs: 250, // throttle UI updates
   // SAB sizing: conservative cap of 128 batches per cell
   PER_CELL_MAX_BATCHES: 128,
 });
 
+const MOBILE_OVERRIDES = Object.freeze({
+  TOTAL_BUDGET_MS: 30000,
+  TARGET_BATCH_MS: 700,
+  CV_FLAG_THRESHOLD: 0.15,
+});
+
+const CONFIG = Object.freeze(isMobile() ? { ...BASE_CONFIG, ...MOBILE_OVERRIDES } : BASE_CONFIG);
+
 // Version emitted with submissions for downstream analysis
-const SCRIPT_VERSION = "4.5.1";
+const SCRIPT_VERSION = "4.6.3";
 
 async function createRunId() {
   try {
@@ -149,10 +162,8 @@ async function getEnv(lang) {
     hardwareConcurrency: navigator.hardwareConcurrency ?? null,
     deviceMemory: navigator.deviceMemory ?? null,
     languages,
-    userAgentData: null,
-    battery: null,
-  visibilityState: document.visibilityState || null,
-  connection: null,
+  userAgentData: null,
+  battery: null,
     lang,
   };
   try {
@@ -175,21 +186,10 @@ async function getEnv(lang) {
       env.battery = { charging: b.charging, level: b.level };
     }
   } catch {}
-  try {
-    const c = (navigator.connection || navigator.mozConnection || navigator.webkitConnection);
-    if (c) {
-      env.connection = {
-        effectiveType: c.effectiveType || null,
-        downlink: typeof c.downlink === 'number' ? c.downlink : null,
-        rtt: typeof c.rtt === 'number' ? c.rtt : null,
-        saveData: Boolean(c.saveData),
-      };
-    }
-  } catch {}
   return env;
 }
 
-function buildRow({ algo, sizeBytes, momMs, bootstrapCi95Ms, medianMs, iqrMs, isStable, remediationAttempts, timerGranularityMs, error, meanMs, ci95Ms }) {
+function buildRow({ algo, sizeBytes, momMs, bootstrapCi95Ms, medianMs, iqrMs, isStable, remediationAttempts, error, meanMs, ci95Ms }, i18nOpt) {
   const tr = document.createElement("tr");
   tr.className = "border-b border-gray-200 last:border-b-0";
   
@@ -203,8 +203,10 @@ function buildRow({ algo, sizeBytes, momMs, bootstrapCi95Ms, medianMs, iqrMs, is
   if (error) {
     const cErr = document.createElement("td");
     cErr.className = "text-left py-2 px-3 text-[var(--color-danger,red)]";
-    cErr.colSpan = 7; // span across remaining columns (total 9 cols; 2 used above)
-    cErr.textContent = `Error: ${String(error)}`;
+  cErr.colSpan = 6; // span across remaining columns (total 8 cols; 2 used above)
+    // Localized error label (fallback to English)
+    const lbl = (i18nOpt && typeof i18nOpt.errorLabel === "string") ? i18nOpt.errorLabel : TEXT.en.errorLabel;
+    cErr.textContent = `${lbl}: ${String(error)}`;
     tr.append(c1, c2, cErr);
     return tr;
   }
@@ -241,24 +243,22 @@ function buildRow({ algo, sizeBytes, momMs, bootstrapCi95Ms, medianMs, iqrMs, is
   c8.className = "text-right py-2 px-3";
   c8.textContent = String(remediationAttempts ?? 0);
 
-  const c9 = document.createElement("td");
-  c9.className = "text-right py-2 px-3";
-  c9.textContent = (timerGranularityMs ?? 0).toFixed(4);
-
-  tr.append(c1, c2, c3, c4, c5, c6, c7, c8, c9);
+  tr.append(c1, c2, c3, c4, c5, c6, c7, c8);
   return tr;
 }
 
 function download(filename, text) {
   const blob = new Blob([text], { type: "text/plain;charset=utf-8" });
   const url = URL.createObjectURL(blob);
-  const a = document.createElement("a");
-  a.href = url;
-  a.download = filename;
-  document.body.appendChild(a);
-  a.click();
-  a.remove();
-  URL.revokeObjectURL(url);
+  try {
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = filename;
+    a.rel = "noopener";
+    a.click();
+  } finally {
+    URL.revokeObjectURL(url);
+  }
 }
 
 function toCSV(results) {
@@ -268,7 +268,7 @@ function toCSV(results) {
     "iterations",
     "batches",
     "momMs",
-  "opsPerSec",
+    "opsPerSec",
     "bootstrapCi95Low",
     "bootstrapCi95High",
     "medianMs",
@@ -277,36 +277,28 @@ function toCSV(results) {
     "coefficientOfVariation",
     "isStable",
     "remediationAttempts",
-    "timerGranularityMs",
-    "calibrationTimeMs",
-  "perBatchMs",
-    "mode",
-    "pairedRunId",
-    "crossOriginIsolated",
   ];
+  const esc = (v) => {
+    const s = String(v ?? "");
+    return /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
+  };
   const rows = results
-    .filter((r) => !r.error) // skip error rows in CSV to keep numeric schema stable
+    .filter((r) => !r.error)
     .map((r) => [
-      r.algo,
-    r.sizeBytes,
-      r.iterations,
-      r.batches ?? "",
-  ((r.momMs ?? r.meanMs) ?? 0).toFixed(6),
-  (r.opsPerSec ?? (r.momMs ? (1000 / r.momMs) : 0)).toFixed(3),
-  (Array.isArray(r.bootstrapCi95Ms) ? r.bootstrapCi95Ms[0] : (Array.isArray(r.ci95Ms) ? r.ci95Ms[0] : 0)).toFixed(6),
-  (Array.isArray(r.bootstrapCi95Ms) ? r.bootstrapCi95Ms[1] : (Array.isArray(r.ci95Ms) ? r.ci95Ms[1] : 0)).toFixed(6),
-  ((r.medianMs ?? r.meanMs) ?? 0).toFixed(6),
-  (r.iqrMs ?? 0).toFixed(6),
-  (r.stdMs ?? 0).toFixed(6),
-  (r.coefficientOfVariation ?? 0).toFixed(6),
-      r.isStable ? "1" : "0",
-      String(r.remediationAttempts ?? 0),
-      (r.timerGranularityMs ?? 0).toFixed(6),
-      (r.calibrationTimeMs ?? 0).toFixed(6),
-    Array.isArray(r.perBatchMs) ? JSON.stringify(r.perBatchMs) : "",
-      (r.mode || ""),
-      (r.pairedRunId || ""),
-      (r.crossOriginIsolated ? "1" : "0"),
+      esc(r.algo),
+      esc(r.sizeBytes),
+      esc(r.iterations),
+      esc(r.batches ?? ""),
+      esc(((r.momMs ?? r.meanMs) ?? 0).toFixed(6)),
+      esc((r.opsPerSec ?? (r.momMs ? (1000 / r.momMs) : 0)).toFixed(3)),
+      esc((Array.isArray(r.bootstrapCi95Ms) ? r.bootstrapCi95Ms[0] : (Array.isArray(r.ci95Ms) ? r.ci95Ms[0] : 0)).toFixed(6)),
+      esc((Array.isArray(r.bootstrapCi95Ms) ? r.bootstrapCi95Ms[1] : (Array.isArray(r.ci95Ms) ? r.ci95Ms[1] : 0)).toFixed(6)),
+      esc(((r.medianMs ?? r.meanMs) ?? 0).toFixed(6)),
+      esc((r.iqrMs ?? 0).toFixed(6)),
+      esc((r.stdMs ?? 0).toFixed(6)),
+      esc((r.coefficientOfVariation ?? 0).toFixed(6)),
+      esc(r.isStable ? "1" : "0"),
+      esc(String(r.remediationAttempts ?? 0)),
     ]);
   return [header.join(","), ...rows.map((r) => r.join(","))].join("\n");
 }
@@ -376,13 +368,10 @@ export function mountCryptoBenchmark(section, { scriptEl, lang: langInput, colle
     try {
       const stable = analyzeRunQuality(finalResults);
       setStatus(statusEl, stable ? i18n.done : i18n.unstableDetected);
-      if (!stable) {
-        statusEl.style.color = "var(--color-danger, #8B0000)";
-        analysis.style.color = "var(--color-danger, #8B0000)";
-      } else {
-        statusEl.style.color = "";
-        analysis.style.color = "";
-      }
+      // Avoid inline styles per Tailwind v4 tokens mandate; toggle a semantic utility class
+  const dangerClass = "text-[var(--color-danger,red)]";
+      statusEl.classList.toggle(dangerClass, !stable);
+      analysis.classList.toggle(dangerClass, !stable);
       setDisabled(btnRetry, false);
       setDisabled(btnCsv, false);
       setDisabled(btnJson, false);
@@ -422,6 +411,9 @@ export function mountCryptoBenchmark(section, { scriptEl, lang: langInput, colle
   let worker = null;
   const abort = new AbortController();
   let firstMessageReceived = false;
+  const runMeta = { timerGranularityMs: 0, sabOverheadMs: 0, crossOriginIsolated: false };
+  // Run-scoped cleanup hook (set inside run())
+  let clearRunResources = () => {};
 
   // Apply the same highlight effect as Submit by toggling the shared 'results-ready' class
   function applyRetryPrimaryStyle() {
@@ -456,6 +448,7 @@ export function mountCryptoBenchmark(section, { scriptEl, lang: langInput, colle
   }
 
   async function run() {
+  const runAbort = new AbortController();
     aborted = false;
     firstMessageReceived = false;
 
@@ -468,15 +461,13 @@ export function mountCryptoBenchmark(section, { scriptEl, lang: langInput, colle
 
     const totalCells = CONFIG.algos.length * CONFIG.sizes.length;
     setStatus(statusEl, i18n.running);
-    if (!globalThis.crossOriginIsolated) {
-      setStatus(statusEl, "Cross-origin isolation is required to run this benchmark.");
-      setDisabled(btnAbort, true);
-      setDisabled(btnStart, false);
-      updateBar(barEl, 0);
-      return;
+    // Allow degraded mode when not cross-origin isolated (no SAB)
+    const coi = Boolean(globalThis.crossOriginIsolated);
+    if (!coi) {
+      debug("info", "cross-origin isolation not present; running in degraded mode (no SAB).", {});
     }
 
-    if (worker) { try { worker.terminate(); } catch {} worker = null; }
+  if (worker) { try { worker.terminate(); } catch {} worker = null; }
     try {
       const trustedURL = getTrustedWorkerURL();
       debug("info", "worker url computed", {
@@ -496,11 +487,11 @@ export function mountCryptoBenchmark(section, { scriptEl, lang: langInput, colle
             message: ev?.message, filename: ev?.filename, lineno: ev?.lineno, colno: ev?.colno
           });
           setStatus(statusEl, `Worker error: ${String(ev?.message || "unknown")}`);
-        }, { signal: abort.signal });
+        }, { signal: runAbort.signal });
         worker.addEventListener("messageerror", (ev) => {
           debug("error", "worker messageerror", { data: String(ev?.data || "") });
           setStatus(statusEl, "Worker message error (serialization)");
-        }, { signal: abort.signal });
+        }, { signal: runAbort.signal });
       } catch {}
     } catch (err) {
       setStatus(statusEl, String(err?.message || err));
@@ -510,55 +501,80 @@ export function mountCryptoBenchmark(section, { scriptEl, lang: langInput, colle
       updateBar(barEl, 0);
       return;
     }
-  const watchdog = setTimeout(() => {
+    const watchdog = setTimeout(() => {
       if (!firstMessageReceived) {
         debug("warn", "watchdog: no messages from worker within 5000ms", {});
         setStatus(statusEl, "Worker did not respond; check CSP/TT logs and network");
       }
     }, 5000);
+    // Expose a run-scoped cleanup that also clears watchdog
+    clearRunResources = () => {
+      try { clearTimeout(watchdog); } catch {}
+      try { runAbort.abort(); } catch {}
+    };
 
-  // Allocate SAB ring buffer for silent per-batch streaming
-  const CTRL_INTS = 8; // VERSION, FLAGS, WR_HEAD, COMMITTED, DROPPED, RUN_ID_LOW, RUN_ID_HIGH, PAD(for 8-byte alignment)
-    const maxSamples = Math.max(1, totalCells * CONFIG.PER_CELL_MAX_BATCHES);
-    const capacityPow2 = 1 << Math.ceil(Math.log2(maxSamples));
-    const ctrlBytes = Int32Array.BYTES_PER_ELEMENT * CTRL_INTS;
-    const dataBytes = Float64Array.BYTES_PER_ELEMENT * capacityPow2;
-    const sab = new SharedArrayBuffer(ctrlBytes + dataBytes);
-    const ctrl = new Int32Array(sab, 0, CTRL_INTS);
-    const data = new Float64Array(sab, ctrlBytes);
-    // Initialize header
-    try {
-      Atomics.store(ctrl, 0, 1); // VERSION
-      Atomics.store(ctrl, 1, 0); // FLAGS
-      Atomics.store(ctrl, 2, 0); // WR_HEAD
-      Atomics.store(ctrl, 3, 0); // COMMITTED
-      Atomics.store(ctrl, 4, 0); // DROPPED
-      Atomics.store(ctrl, 5, 0); // RUN_ID_LOW (unused)
-      Atomics.store(ctrl, 6, 0); // RUN_ID_HIGH (unused)
-    } catch {}
+    // Allocate SAB ring buffer for silent per-batch streaming (only if COI)
+    const CTRL_INTS = 8; // VERSION, FLAGS, WR_HEAD, COMMITTED, DROPPED, RUN_ID_LOW, RUN_ID_HIGH, PAD(for 8-byte alignment)
+    let sab = null;
+    let ctrl = null;
+    let sabData = null;
+    let capacityPow2 = 0;
+    if (coi) {
+      try {
+        const maxSamples = Math.max(1, totalCells * CONFIG.PER_CELL_MAX_BATCHES);
+        const pow = Math.ceil(Math.log2(Math.max(1, maxSamples)));
+        const MAX_EXP = 20; // cap at 2^20 samples
+        const exp = Math.min(pow, MAX_EXP);
+        capacityPow2 = Math.pow(2, exp);
+        const ctrlBytes = Int32Array.BYTES_PER_ELEMENT * CTRL_INTS;
+        const dataBytes = Float64Array.BYTES_PER_ELEMENT * capacityPow2;
+        const MAX_TOTAL_BYTES = 64 * 1024 * 1024; // 64 MiB safety cap
+        if (ctrlBytes + dataBytes > MAX_TOTAL_BYTES) {
+          throw new Error("SAB allocation would exceed memory cap; disabling SAB.");
+        }
+        sab = new SharedArrayBuffer(ctrlBytes + dataBytes);
+        ctrl = new Int32Array(sab, 0, CTRL_INTS);
+        sabData = new Float64Array(sab, ctrlBytes);
+        // Initialize header
+        Atomics.store(ctrl, 0, 1); // VERSION
+        Atomics.store(ctrl, 1, 0); // FLAGS
+        Atomics.store(ctrl, 2, 0); // WR_HEAD
+        Atomics.store(ctrl, 3, 0); // COMMITTED
+        Atomics.store(ctrl, 4, 0); // DROPPED
+        Atomics.store(ctrl, 5, 0); // RUN_ID_LOW (unused)
+        Atomics.store(ctrl, 6, 0); // RUN_ID_HIGH (unused)
+      } catch (e) {
+        debug("warn", "SAB allocation failed; continuing without SAB", { err: String(e) });
+        sab = null; ctrl = null; sabData = null; capacityPow2 = 0;
+      }
+    }
 
     const results = [];
-    const onMessage = async (e) => {
+  const onMessage = async (e) => {
       const data = e.data;
       if (!data || typeof data !== "object") return;
       firstMessageReceived = true;
       debug("info", "worker message", { type: data.type });
-      if (data.type === "progress") {
+  if (data.type === "progress") {
         if (typeof data.completed === "number" && typeof data.total === "number") {
           updateBar(barEl, (data.completed / totalCells) * 100);
         }
         if (typeof data.message === "string") setStatus(statusEl, data.message);
+        if (typeof data.timerGranularityMs === "number") {
+          runMeta.timerGranularityMs = data.timerGranularityMs;
+        }
       } else if (data.type === "result") {
         results.push(data.payload);
-        tbody.appendChild(buildRow(data.payload));
+        tbody.appendChild(buildRow(data.payload, i18n));
         updateBar(barEl, (results.length / totalCells) * 100);
       } else if (data.type === "ready") {
         debug("info", "worker ready", {});
       } else if (data.type === "log") {
         debug("info", "worker log", data);
-      } else if (data.type === "done") {
+  } else if (data.type === "done") {
   try { worker?.removeEventListener?.("message", onMessage); } catch {}
-        try { clearTimeout(watchdog); } catch {}
+    // Ensure per-run cleanup executes (clears watchdog and detaches run-scoped listeners)
+    try { clearRunResources(); } catch {}
         if (aborted) {
           // User aborted; don't proceed with orchestration
           return;
@@ -566,10 +582,23 @@ export function mountCryptoBenchmark(section, { scriptEl, lang: langInput, colle
         debug("info", "done: completed", {});
         // SAB diagnostics
         try {
-          const committed = Atomics.load(ctrl, 3);
-          const dropped = Atomics.load(ctrl, 4);
-          const lastSample = committed > 0 ? data[(committed - 1) & (capacityPow2 - 1)] : null;
-          debug("info", "SAB diagnostics", { committed, dropped, lastSample });
+          if (ctrl && sabData && capacityPow2 > 0) {
+            const committed = Atomics.load(ctrl, 3);
+            const dropped = Atomics.load(ctrl, 4);
+            const lastSample = committed > 0 ? sabData[(committed - 1) & (capacityPow2 - 1)] : null;
+            debug("info", "SAB diagnostics", { committed, dropped, lastSample });
+          }
+        } catch {}
+        // Merge meta if present
+        try {
+          if (data.meta && typeof data.meta === "object") {
+            Object.assign(runMeta, data.meta);
+          }
+        } catch {}
+        try {
+          if (DEBUG && runMeta.debugSeedFingerprint) {
+            secureDevLog("debug", "crypto-benchmark", "debugSeedFingerprint", { id: String(runMeta.debugSeedFingerprint) });
+          }
         } catch {}
         // Finalize single-run scenario
         last = {
@@ -579,10 +608,14 @@ export function mountCryptoBenchmark(section, { scriptEl, lang: langInput, colle
           env: { ...(envCache || (envCache = await getEnv(lang))) },
           results,
         };
+        // Update analysis meta display
+        try {
+          analysis.textContent = `Timer granularity: ${(runMeta.timerGranularityMs || 0).toFixed(4)} ms • SAB overhead: ${(runMeta.sabOverheadMs || 0).toFixed(6)} ms`;
+        } catch {}
   // Pre-enable submit ASAP to avoid race with async env probing in tests
   try { setDisabled(btnSubmit, !COLLECTOR_URL); } catch {}
         finalizeUIAndEnableButtons(results);
-      } else if (data.type === "error") {
+    } else if (data.type === "error") {
         setStatus(statusEl, String(data.error || "Error"));
         setDisabled(btnRetry, false);
         setDisabled(btnAbort, true);
@@ -590,14 +623,12 @@ export function mountCryptoBenchmark(section, { scriptEl, lang: langInput, colle
         setDisabled(btnSubmit, true);
         updateBar(barEl, 100);
   try { worker?.removeEventListener?.("message", onMessage); } catch {}
-        try { clearTimeout(watchdog); } catch {}
+    try { clearRunResources(); } catch {}
       }
     };
-    worker.addEventListener("message", onMessage, { signal: abort.signal });
+  worker.addEventListener("message", onMessage, { signal: runAbort.signal });
     debug("info", "posting measure command", { algos: CONFIG.algos.length, sizes: CONFIG.sizes.length });
-  worker.postMessage({
-      cmd: "measure",
-      cfg: {
+    const cfg = {
         algos: CONFIG.algos,
         sizes: CONFIG.sizes,
         warmupIters: CONFIG.warmupIters,
@@ -606,20 +637,40 @@ export function mountCryptoBenchmark(section, { scriptEl, lang: langInput, colle
         CALIBRATION_ITERS: CONFIG.CALIBRATION_ITERS,
         TARGET_BATCH_MS: CONFIG.TARGET_BATCH_MS,
         MIN_RECORDED_BATCHES: CONFIG.MIN_RECORDED_BATCHES,
+        PER_CELL_MAX_BATCHES: CONFIG.PER_CELL_MAX_BATCHES,
         CV_FLAG_THRESHOLD: CONFIG.CV_FLAG_THRESHOLD,
         CV_STOP_THRESHOLD: CONFIG.CV_STOP_THRESHOLD,
         MAX_REMEDIATION_ATTEMPTS: CONFIG.MAX_REMEDIATION_ATTEMPTS,
         PER_BATCH_SAMPLE_LIMIT: CONFIG.PER_BATCH_SAMPLE_LIMIT,
         poolSize: CONFIG.poolSize,
-  modeRequested: "cross_isolated",
+        modeRequested: coi ? "cross_isolated" : "degraded",
         pairedRunId: "",
-  crossOriginIsolated: true,
-  // SAB config
-  sab,
-  sabCapacity: capacityPow2,
-        includePerBatchInPayload: true,
-      },
-    });
+        crossOriginIsolated: coi,
+        isMobile: isMobile(),
+        DEBUG: DEBUG,
+        includePerBatchInPayload: DEBUG === true,
+      };
+    if (sab && capacityPow2 > 0) {
+      cfg.sab = sab;
+      cfg.sabCapacity = capacityPow2;
+    }
+    worker.postMessage({ cmd: "measure", cfg });
+
+    // Abort run if tab is backgrounded (data integrity)
+    const visibilityHandler = () => {
+      try {
+        if (document.visibilityState === 'hidden') {
+          console.warn('[Benchmark]: Tab backgrounded. Aborting run to ensure data integrity.');
+          try { secureDevLog("warn", "crypto-benchmark", "Tab backgrounded; aborting run to preserve data integrity", {}); } catch {}
+          aborted = true;
+          try { worker?.terminate(); worker = null; } catch {}
+          setStatus(statusEl, 'Benchmark aborted: Tab was moved to the background.');
+      try { clearRunResources(); } catch {}
+          document.removeEventListener('visibilitychange', visibilityHandler);
+        }
+      } catch {}
+    };
+    document.addEventListener('visibilitychange', visibilityHandler, { once: false, signal: runAbort.signal });
   }
 
   // NOTE: Second run is triggered by calling run() again after the first completes (no helper needed)
@@ -634,6 +685,8 @@ export function mountCryptoBenchmark(section, { scriptEl, lang: langInput, colle
   debug("info", "abort: user requested", {});
   setStatus(statusEl, i18n.aborted);
   setDisabled(btnAbort, true);
+  // Clear any run-scoped resources (e.g., watchdog, listeners)
+  try { clearRunResources(); } catch {}
   // Defer the full UI reset to a new macrotask to avoid race with in-flight messages
   setTimeout(resetUI, 0);
     },
@@ -651,10 +704,34 @@ export function mountCryptoBenchmark(section, { scriptEl, lang: langInput, colle
     if (!last || !COLLECTOR_URL) return;
     try {
       setStatus(statusEl, i18n.submitting);
+      // Build secure, trimmed payload per Security Constitution
+      const stable = analyzeRunQuality(last.results);
+      const env = { ...(last.env || {}) };
+      // Ensure we don't transmit deprecated/diagnostic fields
+      try { delete env.visibilityState; } catch {}
+      try { delete env.connection; } catch {}
+      const includeHiEntropy = (Boolean(import.meta?.env?.DEV) || (document.currentScript?.dataset?.debug === "1"));
+      const payload = {
+        runId: last.runId,
+        scriptVersion: last.scriptVersion,
+        isStable: stable,
+        // Flatten env
+        anonId: env.anonId ?? null,
+        origin: env.origin ?? null,
+        userAgent: env.userAgent ?? null,
+        platform: env.platform ?? null,
+        hardwareConcurrency: env.hardwareConcurrency ?? null,
+        deviceMemory: env.deviceMemory ?? null,
+        userAgentData: includeHiEntropy && env.userAgentData ? JSON.stringify(env.userAgentData) : null,
+        battery: includeHiEntropy && env.battery ? JSON.stringify(env.battery) : null,
+        timerGranularityMs: runMeta.timerGranularityMs ?? null,
+        sabOverheadMs: runMeta.sabOverheadMs ?? null,
+        results: last.results.map(({ perBatchMs, calibrationTimeMs, timerGranularityMs, mode, pairedRunId, crossOriginIsolated, ...rest }) => rest),
+      };
       const res = await fetch(COLLECTOR_URL, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(last),
+        body: JSON.stringify(payload),
         // Do not send credentials by default; expect strict CORS on the collector
       });
       if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);

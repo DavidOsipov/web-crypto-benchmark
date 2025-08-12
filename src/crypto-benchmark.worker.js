@@ -6,9 +6,15 @@
 // Author ORCID: 0009-0005-2713-9242
 // Author VIAF: 139173726847611590332
 // Author Wikidata: Q130604188
-// Version: 4.5.1
+// Version: 4.6.3
 // Web Worker for crypto benchmark: performs WebCrypto digest measurements off the main thread.
 import { mean, median, stddev, coefficientOfVariation, quartiles, medianOfMeans, bootstrapCI } from "./crypto-benchmark.stats.js";
+import { createCryptoSeededPRNG, seedFingerprintHex } from "@lib/prng.js";
+
+// Create a single worker-scoped PRNG to ensure consistent seeding across all uses in this run
+const _workerPrngObj = createCryptoSeededPRNG();
+const workerPrng = _workerPrngObj.prng;
+const workerSeedBuffer = _workerPrngObj.seedBuffer;
 
 // SharedArrayBuffer header layout indices (Int32)
 const H_VERSION = 0;
@@ -29,20 +35,28 @@ function wlog(type, payload) {
 // Signal readiness so the main thread can detect startup issues
 try { wlog("ready", {}); } catch {}
 
-function randomBytes(size) {
-  const n = Math.max(1, size | 0);
-  const buf = new Uint8Array(n);
-  const MAX = 65536; // Web Crypto getRandomValues() per-call limit
-  if (n > MAX) {
-    wlog("log", { phase: "rng", info: `chunked ${n} bytes` });
+// Simple sleep utility for cooldowns
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+function createRandomDataPool(size, poolSize) {
+  const prng = workerPrng;
+  const pool = [];
+  for (let i = 0; i < poolSize; i++) {
+    const buf = new Uint8Array(size);
+    const dv = new DataView(buf.buffer, buf.byteOffset, buf.byteLength);
+    let j = 0;
+    // Fill in 4-byte chunks when possible
+    for (; j + 4 <= buf.length; j += 4) {
+      const v32 = ((prng() * 4294967296) >>> 0);
+      dv.setUint32(j, v32, true);
+    }
+    // Remaining tail bytes
+    for (; j < buf.length; j++) {
+      dv.setUint8(j, ((prng() * 256) | 0) & 0xFF);
+    }
+    pool.push(buf);
   }
-  for (let offset = 0; offset < n; ) {
-    const next = Math.min(MAX, n - offset);
-    // subarray returns a typed view suitable for getRandomValues
-    self.crypto.getRandomValues(buf.subarray(offset, offset + next));
-    offset += next;
-  }
-  return buf;
+  return pool;
 }
 
 async function digestOnce(algo, data) {
@@ -67,12 +81,57 @@ function estimateTimerGranularity() {
   return minDiff;
 }
 
-async function measureCell({ algo, size, warmupIters, measureIters, targetMinMs, poolSize, TARGET_BATCH_MS, CV_STOP_THRESHOLD, MIN_RECORDED_BATCHES, PER_BATCH_SAMPLE_LIMIT, sabCtrl, sabData, sabMask, streamSamples }) {
+/**
+ * Measure average SAB publish overhead (ms) using the same reserve/write/publish path.
+ * Runs until a minimum elapsed time for stable averaging.
+ */
+function measureSABOverhead(ctrl, data, capMask) {
+  try {
+    const targetMinMs = 50;
+    const sample = 0.123456789;
+
+    const publish = () => {
+      const head = Atomics.add(ctrl, H_WR_HEAD, 1);
+      const slot = head & capMask;
+      const isValid = Number.isInteger(slot) && slot >= 0;
+      if (isValid) {
+        // eslint-disable-next-line security/detect-object-injection -- bounded slot via mask
+        data[slot] = sample;
+      }
+      // publish contiguously for single-writer
+      const committed = Atomics.load(ctrl, H_COMMITTED);
+      if (committed === head) {
+        Atomics.store(ctrl, H_COMMITTED, head + 1);
+      }
+    };
+
+    // JIT warmup
+    for (let i = 0; i < 2000; i++) publish();
+    Atomics.store(ctrl, H_WR_HEAD, 0);
+    Atomics.store(ctrl, H_COMMITTED, 0);
+    Atomics.store(ctrl, H_DROPPED, 0);
+
+    let iters = 0;
+    const t0 = self.performance.now();
+    do {
+      // modest unroll for timer stability
+      publish(); publish(); publish(); publish(); publish();
+      publish(); publish(); publish(); publish(); publish();
+      iters += 10;
+    } while ((self.performance.now() - t0) < targetMinMs);
+    const t1 = self.performance.now();
+  return (t1 - t0) / Math.max(1, iters);
+  } catch {
+    return 0;
+  }
+}
+
+async function measureCell({ algo, size, warmupIters, measureIters, targetMinMs, poolSize, TARGET_BATCH_MS, CV_STOP_THRESHOLD, MIN_RECORDED_BATCHES, PER_BATCH_SAMPLE_LIMIT, PER_CELL_MAX_BATCHES = 100, sabCtrl, sabData, sabMask, sabCapacity, streamSamples, concurrency = 1 }) {
   const subtle = self.crypto?.subtle;
   if (!subtle?.digest) throw new Error("WebCrypto subtle.digest unavailable");
 
   // Warmup with rotating inputs
-  const pool = Array.from({ length: Math.max(1, poolSize | 0) }, () => randomBytes(size));
+  const pool = createRandomDataPool(size, Math.max(1, poolSize | 0));
   // Adaptive warmup: stop early if moving average stabilizes <1% over last 3 checks
   {
     const maxWarm = Math.max(0, warmupIters | 0);
@@ -98,7 +157,9 @@ async function measureCell({ algo, size, warmupIters, measureIters, targetMinMs,
   // Adaptive batch sizing: target a minimum duration per batch for stability
   const targetBatchMs = Math.max(10, TARGET_BATCH_MS || 125); // >=10ms
   const MAX_TOTAL_ITERS = 100000; // safety cap for very fast ops
-  const MAX_BATCHES = 100; // safety cap for very slow/variable envs
+  // Align batches cap with caller-provided limit while keeping an absolute ceiling
+  const maxBatchesReq = Number(PER_CELL_MAX_BATCHES);
+  const MAX_BATCHES = Math.min(Math.max(1, Number.isFinite(maxBatchesReq) ? Math.trunc(maxBatchesReq) : 100), 1000);
 
   const minMs = Math.max(0, targetMinMs || 0);
   const baseIters = Math.max(1, measureIters | 0);
@@ -113,25 +174,44 @@ async function measureCell({ algo, size, warmupIters, measureIters, targetMinMs,
   // Helper to run a batch with N iterations and return total ms
   async function runBatch(N) {
     const start = self.performance.now();
-    for (let i = 0; i < N; i++) {
-      await subtle.digest(algo, pool.at((totalIters + i) % pool.length));
+    if (concurrency <= 1) {
+      for (let i = 0; i < N; i++) {
+        await subtle.digest(algo, pool.at((totalIters + i) % pool.length));
+      }
+    } else {
+      let i = 0;
+      while (i < N) {
+        const k = Math.min(concurrency, N - i);
+        const promises = [];
+        for (let j = 0; j < k; j++) {
+          promises.push(subtle.digest(algo, pool.at((totalIters + i + j) % pool.length)));
+        }
+        await Promise.all(promises);
+        i += k;
+      }
     }
     const end = self.performance.now();
     return end - start;
   }
 
-  // Initial calibration using baseIters to estimate per-iter time
-  const tCalib = await runBatch(baseIters);
-  totalIters += baseIters;
-  batches += 1;
-  totalElapsedMs += tCalib;
-  perBatchTimesMs.push(tCalib);
-  perBatchIters.push(baseIters);
+  // --- Robust, Multi-Sample Calibration ---
+  const NUM_CALIB_RUNS = 3; // Use a constant for clarity
+  const calibSamplesMs = [];
+  for (let i = 0; i < NUM_CALIB_RUNS; i++) {
+      const t = await runBatch(baseIters);
+      calibSamplesMs.push(t / baseIters); // Store per-iteration time
+  }
 
-  // Estimate iterations needed to hit target batch time, clamp to sensible range
-  const approxPerIter = Math.max(0.0001, tCalib / baseIters); // protect against zero
-  let adaptiveIters = Math.max(1, Math.round(targetBatchMs / approxPerIter));
-  adaptiveIters = Math.min(adaptiveIters, Math.ceil(MAX_TOTAL_ITERS / 10)); // bound per-batch
+  // Use the median of the calibration samples to resist outliers.
+  const approxPerIter = median(calibSamplesMs);
+
+  // Estimate iterations needed to hit target batch time, clamp to a sensible range.
+  let adaptiveIters = Math.max(1, Math.round((Math.max(10, TARGET_BATCH_MS || 125)) / Math.max(1e-6, approxPerIter)));
+  adaptiveIters = Math.min(adaptiveIters, Math.ceil(MAX_TOTAL_ITERS / 10)); // Safety bound
+
+  // NOTE: These calibration runs are intentionally NOT added to the final results.
+
+  // Continue with adaptive batches using the computed adaptiveIters
 
   // Continue running batches until cumulative time exceeds minMs or caps hit, but ensure a minimum recorded batches
   const minBatches = Math.max(0, MIN_RECORDED_BATCHES | 0);
@@ -150,23 +230,25 @@ async function measureCell({ algo, size, warmupIters, measureIters, targetMinMs,
       // reserve a slot
       const head = Atomics.add(sabCtrl, H_WR_HEAD, 1);
       const committed = Atomics.load(sabCtrl, H_COMMITTED);
-      if ((head - committed) > sabMask) {
+      // Capacity in slots; prefer explicit sabCapacity, else derive from mask (power-of-two)
+      const capacity = Number.isInteger(sabCapacity) && sabCapacity > 0 ? sabCapacity : ((sabMask | 0) + 1);
+      // Use the NEW head (head + 1) for occupancy; drop if writing would exceed capacity
+      const occupancy = (head + 1) - committed;
+      if (occupancy > capacity) {
         Atomics.add(sabCtrl, H_DROPPED, 1);
-      }
-      const slot = head & sabMask;
-      // Validate computed slot index to satisfy security lint and prevent OOB writes
-      const isValidSlot = Number.isInteger(slot) && slot >= 0;
-      if (isValidSlot) {
-        // eslint-disable-next-line security/detect-object-injection -- slot is validated and bounded by power-of-two mask
-        sabData[slot] = sample;
-      }
-      // publish if contiguous
-      for (;;) {
+      } else {
+        const slot = head & sabMask;
+        // Validate computed slot index to satisfy security lint and prevent OOB writes
+        const isValidSlot = Number.isInteger(slot) && slot >= 0;
+        if (isValidSlot) {
+          // eslint-disable-next-line security/detect-object-injection -- slot is validated and bounded by power-of-two mask
+          sabData[slot] = sample;
+        }
+        // publish contiguously for single-writer
         const cur = Atomics.load(sabCtrl, H_COMMITTED);
-        if (cur === head) { Atomics.store(sabCtrl, H_COMMITTED, head + 1); break; }
-        if (cur > head) break;
-        // Single-writer should not loop; break defensively
-        break;
+        if (cur === head) {
+          Atomics.store(sabCtrl, H_COMMITTED, head + 1);
+        }
       }
     }
 
@@ -202,7 +284,7 @@ async function measureCell({ algo, size, warmupIters, measureIters, targetMinMs,
   const iqr = q75 - q25;
 
   const mom = medianOfMeans(perIterSamples, 5);
-  const [ciLo, ciHi] = bootstrapCI(perIterSamples, 2000);
+  const [ciLo, ciHi] = bootstrapCI(perIterSamples, 2000, workerPrng);
 
   // Downsample per-batch times for diagnostics payload if needed
   let perBatchOut = perBatchTimesMs.slice();
@@ -231,16 +313,15 @@ async function measureCell({ algo, size, warmupIters, measureIters, targetMinMs,
     // Quality & debug metrics
     coefficientOfVariation: cov,
     stdMs: sd,
-    // Diagnostics
-    perBatchMs: perBatchOut,
     // Raw counts
     iterations: totalIters,
     batches,
     // Throughput
     opsPerSec,
   };
-  if (self && self.DEBUG) {
-    try { out.perBatchMs = perBatchTimesMs.slice(); } catch {}
+  // Keep perBatchMs only in debug/dev builds for local inspection
+  if (self && self.DEBUG && streamSamples) {
+    try { out.perBatchMs = perBatchOut.slice(); } catch {}
   }
   return out;
 }
@@ -249,6 +330,8 @@ self.addEventListener("message", async (ev) => {
   const { cmd, cfg } = ev.data || {};
   if (cmd !== "measure") return;
   try {
+  // Wire debug flag from main thread (strictly opt-in)
+  try { self.DEBUG = Boolean(cfg?.DEBUG); } catch {}
     // Enforce COI only when requested by cfg; allow degraded mode for tests
     if (cfg?.crossOriginIsolated && !self.crossOriginIsolated) {
       self.postMessage({ type: "error", error: "Cross-origin isolation required." });
@@ -274,22 +357,43 @@ self.addEventListener("message", async (ev) => {
       } = cfg || {};
 
     // Wire SAB if provided
-    let sabCtrl = null, sabData = null, sabMask = 0;
+  let sabCtrl = null, sabData = null, sabMask = 0;
+  const sabCapRaw = Number(cfg?.sabCapacity);
+  const sabCapacity = Number.isSafeInteger(sabCapRaw) && sabCapRaw > 0 ? sabCapRaw : 0;
     if (cfg?.sab instanceof SharedArrayBuffer) {
       const CTRL_INTS = 8;
       const ctrlBytes = Int32Array.BYTES_PER_ELEMENT * CTRL_INTS;
       sabCtrl = new Int32Array(cfg.sab, 0, CTRL_INTS);
       sabData = new Float64Array(cfg.sab, ctrlBytes);
-      const cap = Number(cfg.sabCapacity) | 0;
+      const cap = sabCapacity;
       if (cap && (cap & (cap - 1)) === 0) {
         sabMask = cap - 1;
       }
     }
 
 
-    // Phase 0: Environment Probing
+  // Phase 0: Environment Probing
     const timerGranularityMs = estimateTimerGranularity();
     self.postMessage({ type: "progress", phase: 0, message: "Probing timer granularity…", timerGranularityMs });
+
+    // One-time SAB overhead measurement and reset
+    let sabOverheadMs = 0;
+    if (sabCtrl && sabData && sabMask) {
+      try { sabOverheadMs = measureSABOverhead(sabCtrl, sabData, sabMask); } catch {}
+      try {
+        Atomics.store(sabCtrl, H_WR_HEAD, 0);
+        Atomics.store(sabCtrl, H_COMMITTED, 0);
+        Atomics.store(sabCtrl, H_DROPPED, 0);
+      } catch {}
+    }
+
+    // Optional debug-only PRNG seed fingerprint (privacy-safe, never sent by default)
+    let debugSeedFingerprint = null;
+    if (self.DEBUG && typeof seedFingerprintHex === "function") {
+      try {
+        debugSeedFingerprint = await seedFingerprintHex(workerSeedBuffer, 8);
+      } catch {}
+    }
 
     // Phase 1: Calibration
     const totalCells = (algos?.length || 0) * (sizes?.length || 0);
@@ -298,7 +402,7 @@ self.addEventListener("message", async (ev) => {
 
     async function calibrateCell(algo, size) {
       const subtle = self.crypto?.subtle;
-      const pool = Array.from({ length: Math.max(1, poolSize | 0) }, () => randomBytes(size));
+      const pool = createRandomDataPool(size, Math.max(1, poolSize | 0));
       // --- START ADDITION ---
       // Brief fixed warmup to allow JIT optimization before calibration
       const WARMUP_N = 50;
@@ -350,8 +454,8 @@ self.addEventListener("message", async (ev) => {
       self.postMessage({ type: "progress", phase: 2, message: `Measuring ${algo} @ ${Math.round(size / 1024)}KB…`, current: cellsMeasured + 1, total: totalCells, completed: cellsMeasured });
       let remediationAttempts = 0;
       let result;
-      try {
-        result = await measureCell({ algo, size, warmupIters, measureIters, targetMinMs: allocatedMs, poolSize, TARGET_BATCH_MS, CV_STOP_THRESHOLD, MIN_RECORDED_BATCHES, PER_BATCH_SAMPLE_LIMIT, sabCtrl, sabData, sabMask, streamSamples: Boolean(sabCtrl && sabData && sabMask) });
+    try {
+  result = await measureCell({ algo, size, warmupIters, measureIters, targetMinMs: allocatedMs, poolSize, TARGET_BATCH_MS, CV_STOP_THRESHOLD, MIN_RECORDED_BATCHES, PER_BATCH_SAMPLE_LIMIT, PER_CELL_MAX_BATCHES: Number(cfg?.PER_CELL_MAX_BATCHES) || 100, sabCtrl, sabData, sabMask, sabCapacity, streamSamples: Boolean(cfg?.includePerBatchInPayload && sabCtrl && sabData && sabMask), concurrency: Math.max(1, Number(cfg?.concurrency) | 0) || 1 });
       } catch (err) {
         self.postMessage({ type: "result", payload: { algo, sizeBytes: size, error: String(err?.message || err), timerGranularityMs } });
         cellsMeasured += 1;
@@ -363,7 +467,7 @@ self.addEventListener("message", async (ev) => {
         remediationAttempts += 1;
         self.postMessage({ type: "progress", phase: 3, message: "Re-running unstable tests for accuracy…", current: cellsMeasured + 1, total: totalCells });
         try {
-          result = await measureCell({ algo, size, warmupIters, measureIters, targetMinMs: allocatedMs, poolSize, TARGET_BATCH_MS: TARGET_BATCH_MS * 1.5, CV_STOP_THRESHOLD, MIN_RECORDED_BATCHES, PER_BATCH_SAMPLE_LIMIT, sabCtrl, sabData, sabMask, streamSamples: Boolean(sabCtrl && sabData && sabMask) });
+          result = await measureCell({ algo, size, warmupIters, measureIters, targetMinMs: allocatedMs, poolSize, TARGET_BATCH_MS: TARGET_BATCH_MS * 1.5, CV_STOP_THRESHOLD, MIN_RECORDED_BATCHES, PER_BATCH_SAMPLE_LIMIT, PER_CELL_MAX_BATCHES: Number(cfg?.PER_CELL_MAX_BATCHES) || 100, sabCtrl, sabData, sabMask, sabCapacity, streamSamples: Boolean(cfg?.includePerBatchInPayload && sabCtrl && sabData && sabMask), concurrency: Math.max(1, Number(cfg?.concurrency) | 0) || 1 });
           isStable = typeof result.coefficientOfVariation === "number" && result.coefficientOfVariation <= CV_FLAG_THRESHOLD;
         } catch (err2) {
           self.postMessage({ type: "result", payload: { algo, sizeBytes: size, error: String(err2?.message || err2), timerGranularityMs } });
@@ -376,20 +480,19 @@ self.addEventListener("message", async (ev) => {
         ...result,
         isStable,
         remediationAttempts,
-        timerGranularityMs,
-        calibrationTimeMs: cell.calibrationTimeMs,
-  mode: "cross_isolated",
-        pairedRunId,
-        crossOriginIsolated,
       };
       self.postMessage({ type: "result", payload: finalRow });
+      // --- THERMAL COOLDOWN ---
+      if (cfg?.isMobile) {
+        await sleep(1500);
+      }
       cellsMeasured += 1;
     }
     if (sabCtrl) {
       const f = Atomics.load(sabCtrl, H_FLAGS) | DONE_FLAG;
       Atomics.store(sabCtrl, H_FLAGS, f);
     }
-    self.postMessage({ type: "done" });
+  self.postMessage({ type: "done", meta: { timerGranularityMs, sabOverheadMs, crossOriginIsolated: self.crossOriginIsolated === true, ...(self.DEBUG && debugSeedFingerprint ? { debugSeedFingerprint } : {}) } });
   } catch (err) {
     self.postMessage({ type: "error", error: String(err?.message || err) });
   }

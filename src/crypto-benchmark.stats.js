@@ -6,9 +6,9 @@
 // Author ORCID: 0009-0005-2713-9242
 // Author VIAF: 139173726847611590332
 // Author Wikidata: Q130604188
-// Version: 4.5.1
+// Version: 4.6.3
 // Shared statistics helpers for the crypto benchmark
-import { getSecureRandom } from "@utils/security-kit.js";
+import { createCryptoSeededPRNG } from "@lib/prng.js";
 
 export function mean(arr) {
   return arr.reduce((a, b) => a + b, 0) / (arr.length || 1);
@@ -98,22 +98,41 @@ export function medianOfMeans(arr, k = 5) {
 }
 
 // Non-parametric bootstrap 95% CI for the mean of arr. Returns [low, high].
-export function bootstrapCI(arr, num_samples = 2000) {
+export function bootstrapCI(arr, num_samples = 2000, prngArg = null) {
   const n = Array.isArray(arr) ? arr.length : 0;
-  if (n === 0) return [0, 0];
+  if (n <= 1) return [mean(arr) || 0, mean(arr) || 0];
+  let rnd;
+  if (typeof prngArg === 'function') {
+    rnd = prngArg;
+  } else {
+    const { prng } = createCryptoSeededPRNG();
+    rnd = prng;
+  }
   const means = [];
+
   for (let s = 0; s < num_samples; s++) {
     let acc = 0;
+    let used = 0;
     for (let i = 0; i < n; i++) {
-  // Use project-secure RNG to comply with Security Constitution; performance impact is negligible here
-  const u = getSecureRandom(); // 0 <= u < 1
+      // Clamp PRNG value to [0,1) to avoid idx === n when rnd returns 1
+      const u = Math.min(0.999999999, Math.max(0, rnd()));
       const idx = Math.floor(u * n);
-      acc += arr.at(idx) ?? 0;
+      // Validate index before dynamic access per Security Constitution
+      if (Number.isInteger(idx) && idx >= 0 && idx < n) {
+        acc += arr.at(idx) ?? 0;
+        used++;
+      }
     }
-    means.push(acc / n);
+    means.push(acc / Math.max(1, used));
   }
-  means.sort((x, y) => x - y);
-  const loIdx = Math.max(0, Math.floor(num_samples * 0.025) - 1);
-  const hiIdx = Math.min(num_samples - 1, Math.floor(num_samples * 0.975));
-  return [means.at(loIdx) ?? means[0], means.at(hiIdx) ?? means[means.length - 1]];
+
+  means.sort((a, b) => a - b);
+
+  // Corrected percentile indexing to prevent off-by-one errors.
+  const loIdx = Math.max(0, Math.floor((num_samples - 1) * 0.025));
+  const hiIdx = Math.min(num_samples - 1, Math.ceil((num_samples - 1) * 0.975));
+
+  const lo = means.at(loIdx);
+  const hi = means.at(hiIdx);
+  return [lo ?? means[0], hi ?? means[means.length - 1]];
 }
